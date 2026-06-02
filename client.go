@@ -1,4 +1,4 @@
-﻿package twin
+package twin
 
 import (
 	"context"
@@ -50,13 +50,11 @@ func (c *Client) Dial(ctx context.Context) error {
 	return c.authConn()
 }
 
-// SetConn sets an externally-dialed QUIC connection and authenticates it.
 func (c *Client) SetConn(conn *quic.Conn) error {
 	c.conn = conn
 	return c.authConn()
 }
 
-// authConn performs the authentication handshake over the existing QUIC connection.
 func (c *Client) authConn() error {
 	stream, err := c.conn.OpenStream()
 	if err != nil {
@@ -71,6 +69,18 @@ func (c *Client) authConn() error {
 	return nil
 }
 
+func writeTarget(stream io.Writer, target string) error {
+	targetBytes := []byte(target)
+	lenBuf := []byte{byte(len(targetBytes) >> 8), byte(len(targetBytes))}
+	if _, err := stream.Write(lenBuf); err != nil {
+		return err
+	}
+	if _, err := stream.Write(targetBytes); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (c *Client) DialTCP(ctx context.Context, target string) (io.ReadWriteCloser, error) {
 	if c.conn == nil {
 		return nil, fmt.Errorf("not connected")
@@ -80,15 +90,33 @@ func (c *Client) DialTCP(ctx context.Context, target string) (io.ReadWriteCloser
 		return nil, fmt.Errorf("open stream: %w", err)
 	}
 
-	targetBytes := []byte(target)
-	lenBuf := []byte{byte(len(targetBytes) >> 8), byte(len(targetBytes))}
-	if _, err := stream.Write(lenBuf); err != nil {
+	if _, err := stream.Write([]byte{0x00}); err != nil {
 		stream.Close()
-		return nil, fmt.Errorf("write target len: %w", err)
+		return nil, fmt.Errorf("write type: %w", err)
 	}
-	if _, err := stream.Write(targetBytes); err != nil {
+	if err := writeTarget(stream, target); err != nil {
 		stream.Close()
-		return nil, fmt.Errorf("write target: %w", err)
+		return nil, err
+	}
+	return stream, nil
+}
+
+func (c *Client) DialUDP(ctx context.Context, target string) (io.ReadWriteCloser, error) {
+	if c.conn == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	stream, err := c.conn.OpenStream()
+	if err != nil {
+		return nil, fmt.Errorf("open stream: %w", err)
+	}
+
+	if _, err := stream.Write([]byte{0x01}); err != nil {
+		stream.Close()
+		return nil, fmt.Errorf("write type: %w", err)
+	}
+	if err := writeTarget(stream, target); err != nil {
+		stream.Close()
+		return nil, err
 	}
 	return stream, nil
 }
@@ -99,4 +127,3 @@ func (c *Client) Close() error {
 	}
 	return nil
 }
-

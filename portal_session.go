@@ -2,6 +2,7 @@ package twin
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -15,24 +16,20 @@ type PortalSession struct {
 	config *Config
 	ctx    context.Context
 	cancel context.CancelFunc
-
-	udpFlows *PortalUDPFlowManager
 }
 
 func NewPortalSession(conn *quic.Conn, cfg *Config) *PortalSession {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &PortalSession{
-		conn:     conn,
-		config:   cfg,
-		ctx:      ctx,
-		cancel:   cancel,
-		udpFlows: NewPortalUDPFlowManager(),
+		conn:   conn,
+		config: cfg,
+		ctx:    ctx,
+		cancel: cancel,
 	}
 }
 
 func (ps *PortalSession) Run() {
 	defer ps.cancel()
-	defer ps.udpFlows.CloseAll()
 
 	remoteAddr := ps.conn.RemoteAddr().String()
 	logf("portal session: new connection from %s", remoteAddr)
@@ -104,6 +101,11 @@ func (ps *PortalSession) streamLoop() {
 func (ps *PortalSession) handleStream(stream *quic.Stream) {
 	defer stream.Close()
 
+	var typeByte [1]byte
+	if _, err := io.ReadFull(stream, typeByte[:]); err != nil {
+		return
+	}
+
 	var lenBuf [2]byte
 	if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
 		return
@@ -115,6 +117,17 @@ func (ps *PortalSession) handleStream(stream *quic.Stream) {
 	}
 	target := string(targetBytes)
 
+	switch typeByte[0] {
+	case 0x00:
+		ps.handleStreamTCP(stream, target)
+	case 0x01:
+		ps.handleStreamUDP(stream, target)
+	default:
+		logf("portal session: unknown stream type 0x%02x from %s", typeByte[0], target)
+	}
+}
+
+func (ps *PortalSession) handleStreamTCP(stream *quic.Stream, target string) {
 	conn, err := net.Dial("tcp", target)
 	if err != nil {
 		return
@@ -132,5 +145,65 @@ func (ps *PortalSession) handleStream(stream *quic.Stream) {
 		defer wg.Done()
 		io.Copy(conn, stream)
 	}()
+	wg.Wait()
+}
+
+func (ps *PortalSession) handleStreamUDP(stream *quic.Stream, target string) {
+	udpAddr, err := net.ResolveUDPAddr("udp", target)
+	if err != nil {
+		return
+	}
+	conn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// client → target: read length-prefixed frames from stream, write to UDP
+	go func() {
+		defer wg.Done()
+		defer stream.Close()
+		for {
+			var lenBuf [2]byte
+			if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
+				return
+			}
+			datalen := binary.BigEndian.Uint16(lenBuf[:])
+			if datalen == 0 {
+				return
+			}
+			data := make([]byte, datalen)
+			if _, err := io.ReadFull(stream, data); err != nil {
+				return
+			}
+			if _, err := conn.Write(data); err != nil {
+				return
+			}
+		}
+	}()
+
+	// target → client: read from UDP, write length-prefixed frames to stream
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 1500)
+		for {
+			n, err := conn.Read(buf)
+			if err != nil {
+				return
+			}
+			var lenBuf [2]byte
+			binary.BigEndian.PutUint16(lenBuf[:], uint16(n))
+			if _, err := stream.Write(lenBuf[:]); err != nil {
+				return
+			}
+			if _, err := stream.Write(buf[:n]); err != nil {
+				return
+			}
+		}
+	}()
+
 	wg.Wait()
 }
