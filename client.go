@@ -1,11 +1,10 @@
-package twin
+﻿package twin
 
 import (
 	"context"
 	"fmt"
 	"io"
 	"net"
-	"time"
 
 	qtls "github.com/metacubex/tls"
 
@@ -48,39 +47,26 @@ func (c *Client) Dial(ctx context.Context) error {
 		return fmt.Errorf("quic dial: %w", err)
 	}
 	c.conn = conn
+	return c.authConn()
+}
 
-	stream, err := conn.OpenStream()
+// SetConn sets an externally-dialed QUIC connection and authenticates it.
+func (c *Client) SetConn(conn *quic.Conn) error {
+	c.conn = conn
+	return c.authConn()
+}
+
+// authConn performs the authentication handshake over the existing QUIC connection.
+func (c *Client) authConn() error {
+	stream, err := c.conn.OpenStream()
 	if err != nil {
 		return fmt.Errorf("open auth stream: %w", err)
 	}
 	defer stream.Close()
-
-	if err := stream.SetDeadline(time.Now().Add(authStreamDeadline)); err != nil {
-		return fmt.Errorf("set auth deadline: %w", err)
+	if err := WriteAuth(stream, c.config.Password); err != nil {
+		return err
 	}
-
-	pwdBytes := []byte(c.config.Password)
-	var buf []byte
-	pwdLen := []byte{byte(len(pwdBytes) >> 8), byte(len(pwdBytes))}
-	buf = append(buf, pwdLen...)
-	buf = append(buf, pwdBytes...)
-	nonceLen := []byte{0, 16}
-	buf = append(buf, nonceLen...)
-	nonce := make([]byte, 16)
-	buf = append(buf, nonce...)
-
-	if _, err := stream.Write(buf); err != nil {
-		return fmt.Errorf("write auth: %w", err)
-	}
-
-	result := make([]byte, 1)
-	if _, err := io.ReadFull(stream, result); err != nil {
-		return fmt.Errorf("read auth result: %w", err)
-	}
-	if result[0] != 0 {
-		return fmt.Errorf("auth failed")
-	}
-
+	addr := c.config.ServerAddrString()
 	logf("twin client: connected and authenticated to %s", addr)
 	return nil
 }
@@ -113,3 +99,4 @@ func (c *Client) Close() error {
 	}
 	return nil
 }
+
