@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"net"
-	"sync"
 	"time"
 )
 
@@ -44,35 +43,31 @@ func (x *XPlusObfuscator) Deobfuscate(in []byte, out []byte) int {
 type ObfsPacketConn struct {
 	conn net.PacketConn
 	obfs *XPlusObfuscator
-	mu   sync.Mutex
-	buf  []byte
 }
 
 func NewObfsPacketConn(conn net.PacketConn, key []byte) *ObfsPacketConn {
 	return &ObfsPacketConn{
 		conn: conn,
 		obfs: NewXPlusObfuscator(key),
-		buf:  make([]byte, 65536),
 	}
 }
 
 func (c *ObfsPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	n, addr, err := c.conn.ReadFrom(c.buf)
+	buf := make([]byte, 65536)
+	n, addr, err := c.conn.ReadFrom(buf)
 	if err != nil {
 		return 0, nil, err
 	}
-	decLen := c.obfs.Deobfuscate(c.buf[:n], p)
+	decLen := c.obfs.Deobfuscate(buf[:n], p)
 	if decLen == 0 {
-		return 0, nil, nil // skip invalid
+		return 0, nil, nil
 	}
 	return decLen, addr, nil
 }
 
 func (c *ObfsPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	c.mu.Lock()
 	buf := make([]byte, len(p)+saltLen)
 	_ = c.obfs.Obfuscate(p, buf)
-	c.mu.Unlock()
 	_, err := c.conn.WriteTo(buf, addr)
 	if err != nil {
 		return 0, err
