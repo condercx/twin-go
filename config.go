@@ -18,6 +18,7 @@ const (
 	DefaultMaxIdleTimeout                 = 120 * time.Second
 	DefaultKeepAlivePeriod                = 15 * time.Second
 	DefaultUDPPayloadSize                 = 1200
+	DefaultMaxIncomingStreams             = 1024
 
 	maxBurstPackets        = 30
 	defaultBurstMultiplier = 3.0
@@ -79,6 +80,7 @@ type Config struct {
 	MaxStreamReceiveWindow         uint64 `json:"max-stream-receive-window,omitempty"`
 	InitialConnectionReceiveWindow uint64 `json:"initial-connection-receive-window,omitempty"`
 	MaxConnectionReceiveWindow     uint64 `json:"max-connection-receive-window,omitempty"`
+	MaxIncomingStreams             int64  `json:"max-incoming-streams,omitempty"`
 
 	KeepAlivePeriod time.Duration `json:"-"`
 	MaxIdleTimeout  time.Duration `json:"-"`
@@ -99,6 +101,7 @@ func DefaultConfig() Config {
 		MaxConnectionReceiveWindow:     DefaultMaxConnectionReceiveWindow,
 		KeepAlivePeriod:                0,
 		MaxIdleTimeout:                 0,
+		MaxIncomingStreams:             DefaultMaxIncomingStreams,
 	}
 }
 

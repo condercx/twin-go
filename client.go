@@ -7,12 +7,14 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	qtls "github.com/metacubex/tls"
 
 	"github.com/metacubex/quic-go"
 	"github.com/metacubex/quic-go/congestion"
+	"github.com/condercx/twin-go/obfs"
 )
 
 const (
@@ -28,7 +30,11 @@ type Client struct {
 	udpSessionMap   map[uint32]chan *udpMessage
 	udpDefragger    defragger
 
-	sideStream *quic.Stream
+	sideMux  atomic.Pointer[FlowMux]
+	sideMux2 atomic.Pointer[FlowMux]
+
+	obfuscator    *obfs.ObfsPacketConn
+	rawPacketConn net.PacketConn
 }
 
 func NewClient(cfg *Config) *Client {
@@ -43,6 +49,11 @@ func (c *Client) IsClosed() bool {
 }
 
 func (c *Client) Dial(ctx context.Context, packetConn net.PacketConn, udpAddr *net.UDPAddr) error {
+	// Wrap with obfuscation
+	c.rawPacketConn = packetConn
+	key := DeriveObfsKey(c.config.Password)
+	c.obfuscator = obfs.NewObfsPacketConn(packetConn, key)
+
 	tlsCfg := &qtls.Config{
 		ServerName:         c.config.SNI,
 		InsecureSkipVerify: c.config.SkipCert,
@@ -54,7 +65,7 @@ func (c *Client) Dial(ctx context.Context, packetConn net.PacketConn, udpAddr *n
 	}
 
 	quicCfg := NewQUICConfig(c.config)
-	conn, err := quic.Dial(ctx, packetConn, udpAddr, tlsCfg, quicCfg)
+	conn, err := quic.Dial(ctx, c.obfuscator, udpAddr, tlsCfg, quicCfg)
 	if err != nil {
 		return fmt.Errorf("quic dial: %w", err)
 	}
@@ -67,6 +78,14 @@ func (c *Client) SetConn(conn *quic.Conn) error {
 	return c.postAuth()
 }
 
+func (c *Client) SetObfuscatedConn(conn *quic.Conn, rawPkt net.PacketConn) error {
+	c.rawPacketConn = rawPkt
+	key := DeriveObfsKey(c.config.Password)
+	c.obfuscator = obfs.NewObfsPacketConn(rawPkt, key)
+	c.conn = conn
+	return c.postAuth()
+}
+
 func (c *Client) postAuth() error {
 	if err := c.authConn(); err != nil {
 		return err
@@ -74,21 +93,21 @@ func (c *Client) postAuth() error {
 	c.udpSessionMap = make(map[uint32]chan *udpMessage)
 	go c.handleMessage()
 
-	// Optionally open side channel
 	if c.config.SideChannel {
-		go c.openSideStream()
+		go c.openSideStream(0x03)
+		go c.openSideStream(0x04)
 	}
 
 	return nil
 }
 
-func (c *Client) openSideStream() {
+func (c *Client) openSideStream(streamType byte) {
 	stream, err := c.openStream()
 	if err != nil {
 		logf("side channel: open stream failed: %v", err)
 		return
 	}
-	if err := writeHeader(stream, []byte{0x03}); err != nil {
+	if err := writeHeader(stream, []byte{streamType}); err != nil {
 		stream.Close()
 		return
 	}
@@ -96,15 +115,14 @@ func (c *Client) openSideStream() {
 		stream.Close()
 		return
 	}
-	c.sideStream = stream
 
-	// Hold the stream open until connection closes
-	buf := make([]byte, 1)
-	for {
-		_, err := stream.Read(buf)
-		if err != nil {
-			return
-		}
+	mux := NewFlowMux(stream)
+	mux.Start()
+
+	if streamType == 0x03 {
+		c.sideMux.Store(mux)
+	} else {
+		c.sideMux2.Store(mux)
 	}
 }
 
@@ -146,10 +164,8 @@ func (c *Client) openStream() (*quic.Stream, error) {
 	if c.conn == nil {
 		return nil, fmt.Errorf("not connected")
 	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), openStreamTimeout)
 	defer cancel()
-
 	stream, err := c.conn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("open stream: %w", err)
@@ -165,11 +181,15 @@ func writeHeader(stream *quic.Stream, b []byte) error {
 }
 
 func (c *Client) DialTCP(ctx context.Context, target string) (io.ReadWriteCloser, error) {
+	if c.config.SideChannel && c.sideMux.Load() != nil {
+		return c.sideMux.Load().OpenFlow(target)
+	}
+
+	// Legacy direct stream path when side channel disabled
 	stream, err := c.openStream()
 	if err != nil {
 		return nil, err
 	}
-
 	if err := writeHeader(stream, []byte{0x00}); err != nil {
 		stream.Close()
 		return nil, fmt.Errorf("write type: %w", err)
@@ -187,27 +207,16 @@ func (c *Client) DialTCP(ctx context.Context, target string) (io.ReadWriteCloser
 	return stream, nil
 }
 
-func (c *Client) DialUDPStream(ctx context.Context, target string) (io.ReadWriteCloser, error) {
-	stream, err := c.openStream()
-	if err != nil {
-		return nil, err
-	}
+func (c *Client) SideMux() *FlowMux {
+	return c.sideMux.Load()
+}
 
-	if err := writeHeader(stream, []byte{0x01}); err != nil {
-		stream.Close()
-		return nil, fmt.Errorf("write type: %w", err)
-	}
-	targetBytes := []byte(target)
-	lenBuf := []byte{byte(len(targetBytes) >> 8), byte(len(targetBytes))}
-	if err := writeHeader(stream, lenBuf); err != nil {
-		stream.Close()
-		return nil, err
-	}
-	if err := writeHeader(stream, targetBytes); err != nil {
-		stream.Close()
-		return nil, err
-	}
-	return stream, nil
+func (c *Client) SideMux2() *FlowMux {
+	return c.sideMux2.Load()
+}
+
+func (c *Client) Conn() *quic.Conn {
+	return c.conn
 }
 
 func (c *Client) handleMessage() {
@@ -241,7 +250,6 @@ func (c *Client) NewUDPSession(ctx context.Context) (*UDPSession, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	if _, err := stream.Write([]byte{0x02}); err != nil {
 		stream.Close()
 		return nil, fmt.Errorf("write udp open: %w", err)
@@ -326,8 +334,19 @@ func (s *UDPSession) Close() {
 }
 
 func (c *Client) Close() error {
+	if c.sideMux.Load() != nil {
+		c.sideMux.Load().Close()
+	}
+	if c.sideMux2.Load() != nil {
+		c.sideMux2.Load().Close()
+	}
 	if c.conn != nil {
 		return c.conn.CloseWithError(0, "client closing")
 	}
 	return nil
 }
+
+
+
+
+

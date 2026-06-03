@@ -9,6 +9,7 @@ import (
 	qtls "github.com/metacubex/tls"
 
 	"github.com/metacubex/quic-go"
+	"github.com/condercx/twin-go/obfs"
 )
 
 type Server struct {
@@ -39,6 +40,10 @@ func (s *Server) Start() error {
 		return fmt.Errorf("twin server: listen udp: %w", err)
 	}
 
+	// Wrap with obfuscation using the server password as key
+	key := DeriveObfsKey(s.config.Password)
+	obfsConn := obfs.NewObfsPacketConn(udpConn, key)
+
 	tlsCfg := &qtls.Config{
 		Certificates: []qtls.Certificate{s.config.TLSCert},
 		MinVersion:   qtls.VersionTLS13,
@@ -49,7 +54,7 @@ func (s *Server) Start() error {
 	}
 
 	quicCfg := NewQUICConfig(s.config)
-	listener, err := quic.Listen(udpConn, tlsCfg, quicCfg)
+	listener, err := quic.Listen(obfsConn, tlsCfg, quicCfg)
 	if err != nil {
 		udpConn.Close()
 		return fmt.Errorf("twin server: listen quic: %w", err)

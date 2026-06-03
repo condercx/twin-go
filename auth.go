@@ -1,6 +1,7 @@
 package twin
 
 import (
+	"crypto/sha256"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -12,6 +13,7 @@ import (
 const (
 	authNonceSize      = 16
 	authStreamDeadline = 30 * time.Second
+	obfsKeyLen         = 32
 )
 
 var (
@@ -21,6 +23,13 @@ var (
 type AuthStream interface {
 	io.ReadWriteCloser
 	SetDeadline(time.Time) error
+}
+
+// DeriveObfsKey derives an XPlus obfuscation key from the password.
+// Both client and server call this independently with the same password.
+func DeriveObfsKey(password string) []byte {
+	h := sha256.Sum256([]byte(password))
+	return h[:obfsKeyLen]
 }
 
 func WriteAuth(w AuthStream, password string, sendBPS, recvBPS uint64) error {

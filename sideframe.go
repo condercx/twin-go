@@ -25,19 +25,21 @@ var (
 
 const (
 	sideFrameMagic     = 0x4E57
-	sideFrameHeaderLen = 7
+	sideFrameHeaderLen = 11
 )
 
 type SideFrame struct {
 	Type       SideFrameType
+	FlowID     uint32
 	Payload    []byte
 	TargetAddr string
 }
 
 func (f *SideFrame) Marshal() ([]byte, error) {
+	flowID := f.FlowID
 	targetBytes := []byte(f.TargetAddr)
 	targetLen := len(targetBytes)
-	if targetLen > 65535 {
+	if targetLen > 65530 {
 		return nil, fmt.Errorf("target address too long: %d", targetLen)
 	}
 	payloadLen := len(f.Payload)
@@ -49,14 +51,15 @@ func (f *SideFrame) Marshal() ([]byte, error) {
 
 	binary.BigEndian.PutUint16(buf[0:2], sideFrameMagic)
 	buf[2] = byte(f.Type)
-	binary.BigEndian.PutUint16(buf[3:5], uint16(payloadLen))
-	binary.BigEndian.PutUint16(buf[5:7], uint16(targetLen))
+	binary.BigEndian.PutUint32(buf[3:7], flowID)
+	binary.BigEndian.PutUint16(buf[7:9], uint16(payloadLen))
+	binary.BigEndian.PutUint16(buf[9:11], uint16(targetLen))
 
 	if payloadLen > 0 {
-		copy(buf[7:7+payloadLen], f.Payload)
+		copy(buf[11:11+payloadLen], f.Payload)
 	}
 	if targetLen > 0 {
-		copy(buf[7+payloadLen:], targetBytes)
+		copy(buf[11+payloadLen:], targetBytes)
 	}
 	return buf, nil
 }
@@ -71,8 +74,9 @@ func (f *SideFrame) Unmarshal(r io.Reader) error {
 		return ErrBadMagic
 	}
 	f.Type = SideFrameType(header[2])
-	payloadLen := int(binary.BigEndian.Uint16(header[3:5]))
-	targetLen := int(binary.BigEndian.Uint16(header[5:7]))
+	f.FlowID = binary.BigEndian.Uint32(header[3:7])
+	payloadLen := int(binary.BigEndian.Uint16(header[7:9]))
+	targetLen := int(binary.BigEndian.Uint16(header[9:11]))
 
 	totalBody := payloadLen + targetLen
 	if totalBody > 0 {

@@ -13,6 +13,7 @@ func NewQUICConfig(cfg *Config) *quic.Config {
 	maxIdleTimeout := DefaultMaxIdleTimeout
 	keepAlive := DefaultKeepAlivePeriod
 	disablePMTU := true
+	maxStreams := DefaultMaxIncomingStreams
 
 	if cfg != nil {
 		if cfg.InitialStreamReceiveWindow > 0 {
@@ -36,9 +37,11 @@ func NewQUICConfig(cfg *Config) *quic.Config {
 		if cfg.DisablePMTU != nil {
 			disablePMTU = *cfg.DisablePMTU
 		}
+		if cfg.MaxIncomingStreams > 0 {
+			maxStreams = cfg.MaxIncomingStreams
+		}
 	}
 
-	// ensure keepalive is always less than idle timeout
 	if keepAlive >= maxIdleTimeout {
 		keepAlive = maxIdleTimeout / 4
 	}
@@ -55,5 +58,6 @@ func NewQUICConfig(cfg *Config) *quic.Config {
 		KeepAlivePeriod:                keepAlive,
 		EnableDatagrams:                true,
 		DisablePathMTUDiscovery:        disablePMTU,
+		MaxIncomingStreams:             maxStreams,
 	}
 }
