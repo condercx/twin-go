@@ -111,11 +111,6 @@ func (c *Client) openSideStream(streamType byte) {
 		stream.Close()
 		return
 	}
-	if err := writeTarget(stream, ""); err != nil {
-		stream.Close()
-		return
-	}
-
 	mux := NewFlowMux(stream)
 	mux.Start()
 

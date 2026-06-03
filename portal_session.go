@@ -1,4 +1,4 @@
-﻿package twin
+package twin
 
 import (
 	"context"
@@ -171,7 +171,7 @@ func (ps *PortalSession) sideMuxAcceptLoop(mux *FlowMux) {
 	defer mux.Close()
 	for {
 		fa, err := mux.Accept()
-		if err != nil {
+		if err != nil || fa == nil {
 			return
 		}
 		ps.tcpWorker <- struct{}{}
