@@ -13,7 +13,7 @@ func NewQUICConfig(cfg *Config) *quic.Config {
 	maxIdleTimeout := DefaultMaxIdleTimeout
 	keepAlive := DefaultKeepAlivePeriod
 	disablePMTU := true
-	maxStreams := DefaultMaxIncomingStreams
+	maxStreams := int64(DefaultMaxIncomingStreams)
 
 	if cfg != nil {
 		if cfg.InitialStreamReceiveWindow > 0 {
