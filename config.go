@@ -80,6 +80,10 @@ type Config struct {
 	InitialConnectionReceiveWindow uint64 `json:"initial-connection-receive-window,omitempty"`
 	MaxConnectionReceiveWindow     uint64 `json:"max-connection-receive-window,omitempty"`
 
+	KeepAlivePeriod time.Duration `json:"-"`
+	MaxIdleTimeout  time.Duration `json:"-"`
+	DisablePMTU     *bool         `json:"-"`
+
 	TLSCert  qtls.Certificate `json:"-"`
 	CertFile string `json:"cert-file,omitempty"`
 	KeyFile  string `json:"key-file,omitempty"`
@@ -93,6 +97,8 @@ func DefaultConfig() Config {
 		MaxStreamReceiveWindow:         DefaultMaxStreamReceiveWindow,
 		InitialConnectionReceiveWindow: DefaultInitialConnectionReceiveWindow,
 		MaxConnectionReceiveWindow:     DefaultMaxConnectionReceiveWindow,
+		KeepAlivePeriod:                0,
+		MaxIdleTimeout:                 0,
 	}
 }
 
@@ -170,4 +176,3 @@ func (c *Config) ServerAddrString() string {
 	}
 	return c.ServerAddr
 }
-

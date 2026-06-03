@@ -3,6 +3,7 @@ package twin
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,6 +18,8 @@ type PortalSession struct {
 	config *Config
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	udpRelay *udpRelay
 }
 
 func NewPortalSession(conn *quic.Conn, cfg *Config) *PortalSession {
@@ -40,16 +43,16 @@ func (ps *PortalSession) Run() {
 		logf("portal session: auth failed from %s: %v", remoteAddr, err)
 		return
 	}
-	logf("portal session: auth ok from %s", remoteAddr)
+	logf("portal session: auth ok from %s (send=%d recv=%d)", remoteAddr, clientSendBPS, clientRecvBPS)
 
-	// Wire BrutalSender on the server side.
-	// Server sends data TO client ? use client's recvBPS (what they can receive) as our send rate.
-	// Server receives data FROM client ? use client's sendBPS as our recv rate.
 	if clientRecvBPS > 0 {
-		logf("portal session: server BrutalSender send=%d bps (client recv) from client send=%d bps", clientRecvBPS, clientSendBPS)
+		logf("portal session: server BrutalSender send=%d bps (client recv)", clientRecvBPS)
 		sender := NewBrutalSender(congestion.ByteCount(clientRecvBPS))
 		ps.conn.SetCongestionControl(sender)
 	}
+
+	ps.udpRelay = newUDPRelay(ps.conn, ps.ctx)
+	go ps.udpRelay.run()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -76,9 +79,6 @@ func (ps *PortalSession) authenticate() (clientSendBPS, clientRecvBPS uint64, er
 		return clientSendBPS, clientRecvBPS, err
 	}
 
-	// Server responds with its bandwidth allocation.
-	// serverSendBPS = what server will send to client = client's recv capacity
-	// serverRecvBPS = what server expects to receive = client's send capacity
 	serverSendBPS := clientRecvBPS
 	serverRecvBPS := clientSendBPS
 	if err := WriteAuthResult(stream, true, serverSendBPS, serverRecvBPS); err != nil {
@@ -92,7 +92,11 @@ func (ps *PortalSession) streamLoop() {
 	for {
 		stream, err := ps.conn.AcceptStream(ps.ctx)
 		if err != nil {
-			return
+			if ps.ctx.Err() != nil {
+				return
+			}
+			logf("portal session: accept stream error: %v", err)
+			continue
 		}
 		go ps.handleStream(stream)
 	}
@@ -106,24 +110,33 @@ func (ps *PortalSession) handleStream(stream *quic.Stream) {
 		return
 	}
 
-	var lenBuf [2]byte
-	if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
-		return
-	}
-	targetLen := int(lenBuf[0])<<8 | int(lenBuf[1])
-	targetBytes := make([]byte, targetLen)
-	if _, err := io.ReadFull(stream, targetBytes); err != nil {
-		return
-	}
-	target := string(targetBytes)
-
 	switch typeByte[0] {
 	case 0x00:
+		target, err := readTarget(stream)
+		if err != nil {
+			return
+		}
 		ps.handleStreamTCP(stream, target)
 	case 0x01:
+		target, err := readTarget(stream)
+		if err != nil {
+			return
+		}
 		ps.handleStreamUDP(stream, target)
+	case 0x02:
+		target, err := readTarget(stream)
+		if err != nil {
+			return
+		}
+		_ = target
+		sessionID := ps.udpRelay.allocateID()
+		var resp [5]byte
+		resp[0] = 0
+		binary.BigEndian.PutUint32(resp[1:5], sessionID)
+		stream.Write(resp[:5])
+		stream.Close()
 	default:
-		logf("portal session: unknown stream type 0x%02x from %s", typeByte[0], target)
+		logf("portal session: unknown stream type 0x%02x", typeByte[0])
 	}
 }
 
@@ -204,4 +217,117 @@ func (ps *PortalSession) handleStreamUDP(stream *quic.Stream, target string) {
 	}()
 
 	wg.Wait()
+}
+
+type udpRelay struct {
+	conn    *quic.Conn
+	ctx     context.Context
+	mu      sync.Mutex
+	nextID  uint32
+	sockets map[uint32]*udpSocket
+}
+
+type udpSocket struct {
+	id    uint32
+	relay *udpRelay
+	conn  *net.UDPConn
+}
+
+func newUDPRelay(conn *quic.Conn, ctx context.Context) *udpRelay {
+	return &udpRelay{
+		conn:    conn,
+		ctx:     ctx,
+		nextID:  1,
+		sockets: make(map[uint32]*udpSocket),
+	}
+}
+
+func (r *udpRelay) allocateID() uint32 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id := r.nextID
+	r.nextID++
+	return id
+}
+
+func (r *udpRelay) run() {
+	for {
+		raw, err := r.conn.ReceiveDatagram(r.ctx)
+		if err != nil {
+			return
+		}
+		var msg udpMessage
+		if err := msg.unpack(raw); err != nil {
+			continue
+		}
+		r.handleDatagram(msg)
+	}
+}
+
+func (r *udpRelay) handleDatagram(msg udpMessage) {
+	r.mu.Lock()
+	sock, ok := r.sockets[msg.SessionID]
+	r.mu.Unlock()
+
+	if !ok {
+		if len(msg.Host) == 0 {
+			return
+		}
+		udpAddr := &net.UDPAddr{IP: net.ParseIP(msg.Host), Port: int(msg.Port)}
+		if udpAddr.IP == nil {
+			return
+		}
+		udpConn, err := net.DialUDP("udp", nil, udpAddr)
+		if err != nil {
+			return
+		}
+		sock = &udpSocket{
+			id:    msg.SessionID,
+			relay: r,
+			conn:  udpConn,
+		}
+		r.mu.Lock()
+		r.sockets[msg.SessionID] = sock
+		r.mu.Unlock()
+		go sock.readLoop()
+	}
+
+	if len(msg.Data) > 0 {
+		sock.conn.Write(msg.Data)
+	}
+}
+
+func (s *udpSocket) readLoop() {
+	buf := make([]byte, 1500)
+	for {
+		n, err := s.conn.Read(buf)
+		if err != nil {
+			break
+		}
+		addr := s.conn.RemoteAddr().(*net.UDPAddr)
+		replyMsg := udpMessage{
+			SessionID: s.id,
+			Host:      addr.IP.String(),
+			Port:      uint16(addr.Port),
+			FragCount: 1,
+			Data:      make([]byte, n),
+		}
+		copy(replyMsg.Data, buf[:n])
+
+		packed := replyMsg.pack()
+		if err := s.relay.conn.SendDatagram(packed); err != nil {
+			var errSize *quic.DatagramTooLargeError
+			if errors.As(err, &errSize) {
+				frags := fragUDPMessage(replyMsg, int(errSize.MaxDatagramPayloadSize))
+				for _, f := range frags {
+					s.relay.conn.SendDatagram(f.pack())
+				}
+			}
+		}
+	}
+
+	s.relay.mu.Lock()
+	delete(s.relay.sockets, s.id)
+	s.relay.mu.Unlock()
+	s.conn.Close()
 }

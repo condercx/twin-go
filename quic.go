@@ -2,6 +2,7 @@ package twin
 
 import (
 	"github.com/metacubex/quic-go"
+	"time"
 )
 
 func NewQUICConfig(cfg *Config) *quic.Config {
@@ -9,6 +10,9 @@ func NewQUICConfig(cfg *Config) *quic.Config {
 	maxStreamWindow := uint64(DefaultMaxStreamReceiveWindow)
 	initialConnWindow := uint64(DefaultInitialConnectionReceiveWindow)
 	maxConnWindow := uint64(DefaultMaxConnectionReceiveWindow)
+	maxIdleTimeout := DefaultMaxIdleTimeout
+	keepAlive := DefaultKeepAlivePeriod
+	disablePMTU := true
 
 	if cfg != nil {
 		if cfg.InitialStreamReceiveWindow > 0 {
@@ -23,6 +27,23 @@ func NewQUICConfig(cfg *Config) *quic.Config {
 		if cfg.MaxConnectionReceiveWindow > 0 {
 			maxConnWindow = cfg.MaxConnectionReceiveWindow
 		}
+		if cfg.MaxIdleTimeout > 0 {
+			maxIdleTimeout = cfg.MaxIdleTimeout
+		}
+		if cfg.KeepAlivePeriod > 0 {
+			keepAlive = cfg.KeepAlivePeriod
+		}
+		if cfg.DisablePMTU != nil {
+			disablePMTU = *cfg.DisablePMTU
+		}
+	}
+
+	// ensure keepalive is always less than idle timeout
+	if keepAlive >= maxIdleTimeout {
+		keepAlive = maxIdleTimeout / 4
+	}
+	if keepAlive < 5*time.Second {
+		keepAlive = 5 * time.Second
 	}
 
 	return &quic.Config{
@@ -30,9 +51,9 @@ func NewQUICConfig(cfg *Config) *quic.Config {
 		MaxStreamReceiveWindow:         maxStreamWindow,
 		InitialConnectionReceiveWindow: initialConnWindow,
 		MaxConnectionReceiveWindow:     maxConnWindow,
-		MaxIdleTimeout:                 DefaultMaxIdleTimeout,
-		KeepAlivePeriod:                DefaultKeepAlivePeriod,
+		MaxIdleTimeout:                 maxIdleTimeout,
+		KeepAlivePeriod:                keepAlive,
 		EnableDatagrams:                true,
-		DisablePathMTUDiscovery:        true,
+		DisablePathMTUDiscovery:        disablePMTU,
 	}
 }
