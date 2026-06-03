@@ -8,9 +8,15 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/metacubex/quic-go"
 	"github.com/metacubex/quic-go/congestion"
+)
+
+const (
+	tcpConnectTimeout = 10 * time.Second
+	tcpIdleTimeout    = 300 * time.Second
 )
 
 type PortalSession struct {
@@ -141,23 +147,55 @@ func (ps *PortalSession) handleStream(stream *quic.Stream) {
 }
 
 func (ps *PortalSession) handleStreamTCP(stream *quic.Stream, target string) {
-	conn, err := net.Dial("tcp", target)
+	conn, err := net.DialTimeout("tcp", target, tcpConnectTimeout)
 	if err != nil {
 		return
 	}
 	defer conn.Close()
 
+	// Set TCP keepalive and idle timeout
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		tcpConn.SetLinger(0)
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
+
+	// upstream -> client: copy with deadline awareness
 	go func() {
 		defer wg.Done()
-		io.Copy(stream, conn)
-		stream.Close()
+		defer stream.Close()
+		buf := make([]byte, 32*1024)
+		for {
+			conn.SetReadDeadline(time.Now().Add(tcpIdleTimeout))
+			n, err := conn.Read(buf)
+			if err != nil {
+				return
+			}
+			if _, err := stream.Write(buf[:n]); err != nil {
+				return
+			}
+		}
 	}()
+
+	// client -> upstream: copy with deadline awareness
 	go func() {
 		defer wg.Done()
-		io.Copy(conn, stream)
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := stream.Read(buf)
+			if err != nil {
+				return
+			}
+			conn.SetWriteDeadline(time.Now().Add(tcpIdleTimeout))
+			if _, err := conn.Write(buf[:n]); err != nil {
+				return
+			}
+		}
 	}()
+
 	wg.Wait()
 }
 
@@ -191,6 +229,7 @@ func (ps *PortalSession) handleStreamUDP(stream *quic.Stream, target string) {
 			if _, err := io.ReadFull(stream, data); err != nil {
 				return
 			}
+			conn.SetWriteDeadline(time.Now().Add(tcpIdleTimeout))
 			if _, err := conn.Write(data); err != nil {
 				return
 			}
@@ -201,6 +240,7 @@ func (ps *PortalSession) handleStreamUDP(stream *quic.Stream, target string) {
 		defer wg.Done()
 		buf := make([]byte, 1500)
 		for {
+			conn.SetReadDeadline(time.Now().Add(tcpIdleTimeout))
 			n, err := conn.Read(buf)
 			if err != nil {
 				return
@@ -331,3 +371,6 @@ func (s *udpSocket) readLoop() {
 	s.relay.mu.Unlock()
 	s.conn.Close()
 }
+
+
+

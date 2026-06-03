@@ -15,6 +15,11 @@ import (
 	"github.com/metacubex/quic-go/congestion"
 )
 
+const (
+	openStreamTimeout  = 10 * time.Second
+	headerWriteTimeout = 10 * time.Second
+)
+
 type Client struct {
 	config *Config
 	conn   *quic.Conn
@@ -70,7 +75,10 @@ func (c *Client) postAuth() error {
 }
 
 func (c *Client) authConn() error {
-	stream, err := c.conn.OpenStream()
+	ctx, cancel := context.WithTimeout(context.Background(), authStreamDeadline)
+	defer cancel()
+
+	stream, err := c.conn.OpenStreamSync(ctx)
 	if err != nil {
 		return fmt.Errorf("open auth stream: %w", err)
 	}
@@ -104,19 +112,22 @@ func (c *Client) openStream() (*quic.Stream, error) {
 	if c.conn == nil {
 		return nil, fmt.Errorf("not connected")
 	}
-	stream, err := c.conn.OpenStream()
-	if err == nil {
-		return stream, nil
-	}
-	if _, ok := err.(net.Error); !ok {
+
+	ctx, cancel := context.WithTimeout(context.Background(), openStreamTimeout)
+	defer cancel()
+
+	stream, err := c.conn.OpenStreamSync(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("open stream: %w", err)
 	}
-	time.Sleep(100 * time.Millisecond)
-	stream, err = c.conn.OpenStream()
-	if err != nil {
-		return nil, fmt.Errorf("open stream (retry): %w", err)
-	}
 	return stream, nil
+}
+
+func writeHeader(stream *quic.Stream, b []byte) error {
+	stream.SetWriteDeadline(time.Now().Add(headerWriteTimeout))
+	_, err := stream.Write(b)
+	stream.SetWriteDeadline(time.Time{})
+	return err
 }
 
 func (c *Client) DialTCP(ctx context.Context, target string) (io.ReadWriteCloser, error) {
@@ -125,11 +136,17 @@ func (c *Client) DialTCP(ctx context.Context, target string) (io.ReadWriteCloser
 		return nil, err
 	}
 
-	if _, err := stream.Write([]byte{0x00}); err != nil {
+	if err := writeHeader(stream, []byte{0x00}); err != nil {
 		stream.Close()
 		return nil, fmt.Errorf("write type: %w", err)
 	}
-	if err := writeTarget(stream, target); err != nil {
+	targetBytes := []byte(target)
+	lenBuf := []byte{byte(len(targetBytes) >> 8), byte(len(targetBytes))}
+	if err := writeHeader(stream, lenBuf); err != nil {
+		stream.Close()
+		return nil, err
+	}
+	if err := writeHeader(stream, targetBytes); err != nil {
 		stream.Close()
 		return nil, err
 	}
@@ -142,11 +159,17 @@ func (c *Client) DialUDPStream(ctx context.Context, target string) (io.ReadWrite
 		return nil, err
 	}
 
-	if _, err := stream.Write([]byte{0x01}); err != nil {
+	if err := writeHeader(stream, []byte{0x01}); err != nil {
 		stream.Close()
 		return nil, fmt.Errorf("write type: %w", err)
 	}
-	if err := writeTarget(stream, target); err != nil {
+	targetBytes := []byte(target)
+	lenBuf := []byte{byte(len(targetBytes) >> 8), byte(len(targetBytes))}
+	if err := writeHeader(stream, lenBuf); err != nil {
+		stream.Close()
+		return nil, err
+	}
+	if err := writeHeader(stream, targetBytes); err != nil {
 		stream.Close()
 		return nil, err
 	}
