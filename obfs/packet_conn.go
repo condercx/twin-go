@@ -58,9 +58,12 @@ func (c *ObfsPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	if err != nil {
 		return 0, nil, err
 	}
+	if n < saltLen {
+		return 0, addr, nil
+	}
 	decLen := c.obfs.Deobfuscate(buf[:n], p)
 	if decLen == 0 {
-		return 0, nil, nil
+		return 0, addr, nil
 	}
 	return decLen, addr, nil
 }
