@@ -9,6 +9,7 @@ import (
 	qtls "github.com/metacubex/tls"
 
 	"github.com/metacubex/quic-go"
+	"github.com/metacubex/quic-go/congestion"
 )
 
 type Client struct {
@@ -20,17 +21,7 @@ func NewClient(cfg *Config) *Client {
 	return &Client{config: cfg}
 }
 
-func (c *Client) Dial(ctx context.Context) error {
-	addr := c.config.ServerAddrString()
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return fmt.Errorf("resolve: %w", err)
-	}
-	packetConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-	if err != nil {
-		return fmt.Errorf("udp conn: %w", err)
-	}
-
+func (c *Client) Dial(ctx context.Context, packetConn net.PacketConn, udpAddr *net.UDPAddr) error {
 	tlsCfg := &qtls.Config{
 		ServerName:         c.config.SNI,
 		InsecureSkipVerify: c.config.SkipCert,
@@ -61,14 +52,42 @@ func (c *Client) authConn() error {
 		return fmt.Errorf("open auth stream: %w", err)
 	}
 	defer stream.Close()
-	if err := WriteAuth(stream, c.config.Password); err != nil {
-		return err
+
+	// Send auth with bandwidth info
+	sendBPS := c.config.UpBPS
+	recvBPS := c.config.DownBPS
+	if sendBPS == 0 {
+		sendBPS = 100 * 1024 * 1024 // default 100 Mbps
 	}
+	if recvBPS == 0 {
+		recvBPS = 100 * 1024 * 1024
+	}
+	// We send UpBPS (what client can send) and DownBPS (what client can receive)
+	// From client perspective:
+	//   sendBPS = our upload capacity = what we send TO server = server's recv
+	//   recvBPS = our download capacity = what we receive FROM server = server's send
+	tx := sendBPS
+	rx := recvBPS
+
+	if err := WriteAuth(stream, c.config.Password, tx, rx); err != nil {
+		return fmt.Errorf("auth: %w", err)
+	}
+
+	// Server responds with what it will use for its BrutalSender
+	// We already read serverBPS from auth result in WriteAuth
+	// Apply BrutalSender for client's upload direction (what client sends to server)
+	if tx > 0 {
+		logf("setting client BrutalSender send BPS=%d (server recv)", tx)
+		sender := NewBrutalSender(congestion.ByteCount(tx))
+		c.conn.SetCongestionControl(sender)
+	}
+
 	addr := c.config.ServerAddrString()
-	logf("twin client: connected and authenticated to %s", addr)
+	logf("twin client: connected and authenticated to %s (tx=%d bps, rx=%d bps)", addr, tx, rx)
 	return nil
 }
 
+// writeTarget writes length-prefixed target address to stream
 func writeTarget(stream io.Writer, target string) error {
 	targetBytes := []byte(target)
 	lenBuf := []byte{byte(len(targetBytes) >> 8), byte(len(targetBytes))}

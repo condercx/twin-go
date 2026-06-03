@@ -23,7 +23,7 @@ type AuthStream interface {
 	SetDeadline(time.Time) error
 }
 
-func WriteAuth(w AuthStream, password string) error {
+func WriteAuth(w AuthStream, password string, sendBPS, recvBPS uint64) error {
 	if err := w.SetDeadline(time.Now().Add(authStreamDeadline)); err != nil {
 		return fmt.Errorf("set auth deadline: %w", err)
 	}
@@ -35,7 +35,6 @@ func WriteAuth(w AuthStream, password string) error {
 
 	pwdBytes := []byte(password)
 
-	// Format: [pwdLen:2][pwdBytes][nonceLen:2][nonceBytes]
 	var buf []byte
 	pwdLen := make([]byte, 2)
 	binary.BigEndian.PutUint16(pwdLen, uint16(len(pwdBytes)))
@@ -46,58 +45,82 @@ func WriteAuth(w AuthStream, password string) error {
 	buf = append(buf, nonceLen...)
 	buf = append(buf, nonce...)
 
+	bpsBuf := make([]byte, 16)
+	binary.BigEndian.PutUint64(bpsBuf[0:8], sendBPS)
+	binary.BigEndian.PutUint64(bpsBuf[8:16], recvBPS)
+	buf = append(buf, bpsBuf...)
+
 	if _, err := w.Write(buf); err != nil {
 		return fmt.Errorf("write auth: %w", err)
 	}
 
-	result := make([]byte, 1)
-	if _, err := io.ReadFull(w, result); err != nil {
-		return fmt.Errorf("read auth result: %w", err)
+	success, _, _, err := ReadAuthResult(w)
+	if err != nil {
+		return err
 	}
-	if result[0] != 0 {
+	if !success {
 		return ErrAuthFailed
 	}
 	return nil
 }
 
-func ReadAuth(r io.Reader, expectedPassword string) error {
+func ReadAuth(r io.Reader, expectedPassword string) (sendBPS, recvBPS uint64, err error) {
 	lenBuf := make([]byte, 2)
 
 	if _, err := io.ReadFull(r, lenBuf); err != nil {
-		return fmt.Errorf("read pwd len: %w", err)
+		return 0, 0, fmt.Errorf("read pwd len: %w", err)
 	}
 	pwdLen := binary.BigEndian.Uint16(lenBuf)
 
 	pwdBytes := make([]byte, pwdLen)
 	if _, err := io.ReadFull(r, pwdBytes); err != nil {
-		return fmt.Errorf("read pwd: %w", err)
+		return 0, 0, fmt.Errorf("read pwd: %w", err)
 	}
 
 	if _, err := io.ReadFull(r, lenBuf); err != nil {
-		return fmt.Errorf("read nonce len: %w", err)
+		return 0, 0, fmt.Errorf("read nonce len: %w", err)
 	}
 	nonceLen := binary.BigEndian.Uint16(lenBuf)
 
 	nonce := make([]byte, nonceLen)
 	if _, err := io.ReadFull(r, nonce); err != nil {
-		return fmt.Errorf("read nonce: %w", err)
+		return 0, 0, fmt.Errorf("read nonce: %w", err)
 	}
-
 	_ = nonce
 
-	if string(pwdBytes) != expectedPassword {
-		return ErrAuthFailed
+	bpsBuf := make([]byte, 16)
+	if _, err := io.ReadFull(r, bpsBuf); err != nil {
+		return 0, 0, fmt.Errorf("read bps: %w", err)
 	}
-	return nil
+	sendBPS = binary.BigEndian.Uint64(bpsBuf[0:8])
+	recvBPS = binary.BigEndian.Uint64(bpsBuf[8:16])
+
+	if string(pwdBytes) != expectedPassword {
+		return sendBPS, recvBPS, ErrAuthFailed
+	}
+	return sendBPS, recvBPS, nil
 }
 
-func WriteAuthResult(w io.Writer, success bool) error {
-	var result byte
+func WriteAuthResult(w io.Writer, success bool, serverSendBPS, serverRecvBPS uint64) error {
+	buf := make([]byte, 17)
 	if success {
-		result = 0
+		buf[0] = 0
 	} else {
-		result = 1
+		buf[0] = 1
 	}
-	_, err := w.Write([]byte{result})
+	binary.BigEndian.PutUint64(buf[1:9], serverSendBPS)
+	binary.BigEndian.PutUint64(buf[9:17], serverRecvBPS)
+	_, err := w.Write(buf)
 	return err
+}
+
+func ReadAuthResult(r io.Reader) (success bool, serverSendBPS, serverRecvBPS uint64, err error) {
+	buf := make([]byte, 17)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return false, 0, 0, fmt.Errorf("read auth result: %w", err)
+	}
+	success = buf[0] == 0
+	serverSendBPS = binary.BigEndian.Uint64(buf[1:9])
+	serverRecvBPS = binary.BigEndian.Uint64(buf[9:17])
+	return
 }

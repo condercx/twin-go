@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/metacubex/quic-go"
+	"github.com/metacubex/quic-go/congestion"
 )
 
 type PortalSession struct {
@@ -34,11 +35,21 @@ func (ps *PortalSession) Run() {
 	remoteAddr := ps.conn.RemoteAddr().String()
 	logf("portal session: new connection from %s", remoteAddr)
 
-	if err := ps.authenticate(); err != nil {
+	clientSendBPS, clientRecvBPS, err := ps.authenticate()
+	if err != nil {
 		logf("portal session: auth failed from %s: %v", remoteAddr, err)
 		return
 	}
 	logf("portal session: auth ok from %s", remoteAddr)
+
+	// Wire BrutalSender on the server side.
+	// Server sends data TO client ? use client's recvBPS (what they can receive) as our send rate.
+	// Server receives data FROM client ? use client's sendBPS as our recv rate.
+	if clientRecvBPS > 0 {
+		logf("portal session: server BrutalSender send=%d bps (client recv) from client send=%d bps", clientRecvBPS, clientSendBPS)
+		sender := NewBrutalSender(congestion.ByteCount(clientRecvBPS))
+		ps.conn.SetCongestionControl(sender)
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -49,43 +60,32 @@ func (ps *PortalSession) Run() {
 	wg.Wait()
 }
 
-func (ps *PortalSession) authenticate() error {
+func (ps *PortalSession) authenticate() (clientSendBPS, clientRecvBPS uint64, err error) {
 	ctx, cancel := context.WithTimeout(ps.ctx, authStreamDeadline)
 	defer cancel()
 
 	stream, err := ps.conn.AcceptStream(ctx)
 	if err != nil {
-		return fmt.Errorf("accept auth stream: %w", err)
+		return 0, 0, fmt.Errorf("accept auth stream: %w", err)
 	}
 	defer stream.Close()
 
-	var lenBuf [2]byte
-	if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
-		return fmt.Errorf("read pwd len: %w", err)
-	}
-	pwdLen := int(lenBuf[0])<<8 | int(lenBuf[1])
-
-	receivedPwd := make([]byte, pwdLen)
-	if _, err := io.ReadFull(stream, receivedPwd); err != nil {
-		return fmt.Errorf("read pwd: %w", err)
-	}
-	if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
-		return fmt.Errorf("read nonce len: %w", err)
-	}
-	nonceLen := int(lenBuf[0])<<8 | int(lenBuf[1])
-	nonce := make([]byte, nonceLen)
-	if _, err := io.ReadFull(stream, nonce); err != nil {
-		return fmt.Errorf("read nonce: %w", err)
+	clientSendBPS, clientRecvBPS, err = ReadAuth(stream, ps.config.Password)
+	if err != nil {
+		WriteAuthResult(stream, false, 0, 0)
+		return clientSendBPS, clientRecvBPS, err
 	}
 
-	if string(receivedPwd) != ps.config.Password {
-		stream.Write([]byte{1})
-		return fmt.Errorf("password mismatch")
+	// Server responds with its bandwidth allocation.
+	// serverSendBPS = what server will send to client = client's recv capacity
+	// serverRecvBPS = what server expects to receive = client's send capacity
+	serverSendBPS := clientRecvBPS
+	serverRecvBPS := clientSendBPS
+	if err := WriteAuthResult(stream, true, serverSendBPS, serverRecvBPS); err != nil {
+		return 0, 0, fmt.Errorf("write auth result: %w", err)
 	}
-	if _, err := stream.Write([]byte{0}); err != nil {
-		return fmt.Errorf("write auth ok: %w", err)
-	}
-	return nil
+
+	return clientSendBPS, clientRecvBPS, nil
 }
 
 func (ps *PortalSession) streamLoop() {
@@ -162,7 +162,6 @@ func (ps *PortalSession) handleStreamUDP(stream *quic.Stream, target string) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// client → target: read length-prefixed frames from stream, write to UDP
 	go func() {
 		defer wg.Done()
 		defer stream.Close()
@@ -185,7 +184,6 @@ func (ps *PortalSession) handleStreamUDP(stream *quic.Stream, target string) {
 		}
 	}()
 
-	// target → client: read from UDP, write length-prefixed frames to stream
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, 1500)
