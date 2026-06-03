@@ -16,7 +16,7 @@ import (
 
 const (
 	tcpConnectTimeout = 10 * time.Second
-	tcpIdleTimeout    = 300 * time.Second
+	streamIdleTimeout = 300 * time.Second
 )
 
 type PortalSession struct {
@@ -26,6 +26,9 @@ type PortalSession struct {
 	cancel context.CancelFunc
 
 	udpRelay *udpRelay
+
+	// SideChannel
+	sideStream *quic.Stream
 }
 
 func NewPortalSession(conn *quic.Conn, cfg *Config) *PortalSession {
@@ -130,6 +133,7 @@ func (ps *PortalSession) handleStream(stream *quic.Stream) {
 		}
 		ps.handleStreamUDP(stream, target)
 	case 0x02:
+		// Server-side UDP datagram session allocation
 		target, err := readTarget(stream)
 		if err != nil {
 			return
@@ -141,6 +145,13 @@ func (ps *PortalSession) handleStream(stream *quic.Stream) {
 		binary.BigEndian.PutUint32(resp[1:5], sessionID)
 		stream.Write(resp[:5])
 		stream.Close()
+	case 0x03:
+		// SideChannel stream ? keep alive and service reads
+		// Reads data and routes to SideChannel logic (stub for now)
+		logf("portal session: side channel established from %s", ps.conn.RemoteAddr().String())
+		ps.sideStream = stream
+		// Block until context cancelled, keeping the stream open
+		<-ps.ctx.Done()
 	default:
 		logf("portal session: unknown stream type 0x%02x", typeByte[0])
 	}
@@ -153,47 +164,39 @@ func (ps *PortalSession) handleStreamTCP(stream *quic.Stream, target string) {
 	}
 	defer conn.Close()
 
-	// Set TCP keepalive and idle timeout
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		tcpConn.SetLinger(0)
 	}
+
+	// Use context-based idle timeout
+	streamCtx, cancel := context.WithCancel(ps.ctx)
+	defer cancel()
+
+	go func() {
+		timer := time.NewTimer(streamIdleTimeout)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			cancel()
+		case <-streamCtx.Done():
+		}
+	}()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// upstream -> client: copy with deadline awareness
+	// upstream ? client: io.Copy is fine, exits on EOF or context
 	go func() {
 		defer wg.Done()
 		defer stream.Close()
-		buf := make([]byte, 32*1024)
-		for {
-			conn.SetReadDeadline(time.Now().Add(tcpIdleTimeout))
-			n, err := conn.Read(buf)
-			if err != nil {
-				return
-			}
-			if _, err := stream.Write(buf[:n]); err != nil {
-				return
-			}
-		}
+		io.Copy(stream, conn)
 	}()
 
-	// client -> upstream: copy with deadline awareness
+	// client ? upstream
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := stream.Read(buf)
-			if err != nil {
-				return
-			}
-			conn.SetWriteDeadline(time.Now().Add(tcpIdleTimeout))
-			if _, err := conn.Write(buf[:n]); err != nil {
-				return
-			}
-		}
+		io.Copy(conn, stream)
 	}()
 
 	wg.Wait()
@@ -213,6 +216,7 @@ func (ps *PortalSession) handleStreamUDP(stream *quic.Stream, target string) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// client ? target: read length-prefixed frames, write to UDP
 	go func() {
 		defer wg.Done()
 		defer stream.Close()
@@ -229,18 +233,17 @@ func (ps *PortalSession) handleStreamUDP(stream *quic.Stream, target string) {
 			if _, err := io.ReadFull(stream, data); err != nil {
 				return
 			}
-			conn.SetWriteDeadline(time.Now().Add(tcpIdleTimeout))
 			if _, err := conn.Write(data); err != nil {
 				return
 			}
 		}
 	}()
 
+	// target ? client: read from UDP, write length-prefixed to stream
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, 1500)
 		for {
-			conn.SetReadDeadline(time.Now().Add(tcpIdleTimeout))
 			n, err := conn.Read(buf)
 			if err != nil {
 				return
@@ -258,6 +261,8 @@ func (ps *PortalSession) handleStreamUDP(stream *quic.Stream, target string) {
 
 	wg.Wait()
 }
+
+// --- UDP Relay (datagram-based) ---
 
 type udpRelay struct {
 	conn    *quic.Conn
@@ -371,6 +376,3 @@ func (s *udpSocket) readLoop() {
 	s.relay.mu.Unlock()
 	s.conn.Close()
 }
-
-
-

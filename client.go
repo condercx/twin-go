@@ -27,6 +27,8 @@ type Client struct {
 	udpSessionMutex sync.RWMutex
 	udpSessionMap   map[uint32]chan *udpMessage
 	udpDefragger    defragger
+
+	sideStream *quic.Stream
 }
 
 func NewClient(cfg *Config) *Client {
@@ -71,7 +73,39 @@ func (c *Client) postAuth() error {
 	}
 	c.udpSessionMap = make(map[uint32]chan *udpMessage)
 	go c.handleMessage()
+
+	// Optionally open side channel
+	if c.config.SideChannel {
+		go c.openSideStream()
+	}
+
 	return nil
+}
+
+func (c *Client) openSideStream() {
+	stream, err := c.openStream()
+	if err != nil {
+		logf("side channel: open stream failed: %v", err)
+		return
+	}
+	if err := writeHeader(stream, []byte{0x03}); err != nil {
+		stream.Close()
+		return
+	}
+	if err := writeTarget(stream, ""); err != nil {
+		stream.Close()
+		return
+	}
+	c.sideStream = stream
+
+	// Hold the stream open until connection closes
+	buf := make([]byte, 1)
+	for {
+		_, err := stream.Read(buf)
+		if err != nil {
+			return
+		}
+	}
 }
 
 func (c *Client) authConn() error {
