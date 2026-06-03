@@ -1,4 +1,4 @@
-package twin
+ï»¿package twin
 
 import (
 	"context"
@@ -146,7 +146,7 @@ func (ps *PortalSession) handleStream(stream *quic.Stream) {
 		stream.Write(resp[:5])
 
 	case 0x03:
-		// Primary side channel flow mux ¡ª stream stays open
+		// Primary side channel flow mux - stream stays open
 		logf("portal session: primary side channel from %s", ps.conn.RemoteAddr().String())
 		mux := NewFlowMux(stream)
 		mux.Start()
@@ -154,7 +154,7 @@ func (ps *PortalSession) handleStream(stream *quic.Stream) {
 		go ps.sideMuxAcceptLoop(mux)
 
 	case 0x04:
-		// Secondary side channel flow mux ¡ª stream stays open
+		// Secondary side channel flow mux - stream stays open
 		logf("portal session: secondary side channel from %s", ps.conn.RemoteAddr().String())
 		mux := NewFlowMux(stream)
 		mux.Start()

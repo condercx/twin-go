@@ -80,7 +80,7 @@ type Config struct {
 	MaxStreamReceiveWindow         uint64 `json:"max-stream-receive-window,omitempty"`
 	InitialConnectionReceiveWindow uint64 `json:"initial-connection-receive-window,omitempty"`
 	MaxConnectionReceiveWindow     uint64 `json:"max-connection-receive-window,omitempty"`
-	MaxIncomingStreams             int64  `json:"max-incoming-streams,omitempty"`
+	MaxIncomingStreams             int  `json:"max-incoming-streams,omitempty"`
 
 	KeepAlivePeriod time.Duration `json:"-"`
 	MaxIdleTimeout  time.Duration `json:"-"`
@@ -179,3 +179,4 @@ func (c *Config) ServerAddrString() string {
 	}
 	return c.ServerAddr
 }
+
