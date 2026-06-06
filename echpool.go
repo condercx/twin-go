@@ -20,7 +20,6 @@ import (
 	"github.com/xtaci/smux"
 )
 
-// Global tunables.
 var (
 	DialTimeout        = 3 * time.Second
 	WSHandshakeTimeout = 5 * time.Second
@@ -43,19 +42,6 @@ type ECHPool struct {
 	readyCount    int32
 }
 
-func (p *ECHPool) WaitForReady(timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for {
-		if int(atomic.LoadInt32(&p.readyCount)) >= len(p.smuxConns)/2+1 {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("twin: timeout waiting for channels to connect")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
 func NewECHPool(cfg *ClientConfig) *ECHPool {
 	total := cfg.ConnCount
 	if len(cfg.ProxyIPs) > 0 {
@@ -69,6 +55,19 @@ func NewECHPool(cfg *ClientConfig) *ECHPool {
 		cfg:           *cfg,
 		smuxConns:     make([]*smux.Session, total),
 		channelRTT:    make([]int64, total),
+	}
+}
+
+func (p *ECHPool) WaitForReady(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if int(atomic.LoadInt32(&p.readyCount)) >= len(p.smuxConns)/2+1 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("twin: timeout waiting for channels to connect")
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -210,8 +209,19 @@ func (p *ECHPool) openUDPStream(target string) (*smux.Stream, int, int, error) {
 	return s, chID, decision, nil
 }
 
+func (p *ECHPool) Close() error {
+	p.wsConnsMu.Lock()
+	defer p.wsConnsMu.Unlock()
+	for i, sess := range p.smuxConns {
+		if sess != nil {
+			_ = sess.Close()
+			p.smuxConns[i] = nil
+		}
+	}
+	return nil
+}
+
 func dialWebSocket(cfg *ClientConfig, ip string, channelID int) (*websocket.Conn, error) {
-	// Use SNI as the URL host (for Host header and SNI), ip only for TCP connect
 	hostName := cfg.SNI
 	if hostName == "" {
 		hostName = cfg.ServerAddr
@@ -253,22 +263,14 @@ func dialWebSocket(cfg *ClientConfig, ip string, channelID int) (*websocket.Conn
 		return conn, err
 	}
 
-	// wss: use ECH or standard TLS
+	// wss path
 	serverName := cfg.SNI
 	var tlsCfg *tls.Config
-
-	if cfg.ECHHost != "" {
-		if err := prepareECH(cfg.ECHHost, cfg.ECHDNSServer); err != nil {
-			logf("[client] ECH prepare failed (fallback to standard TLS): %v", err)
-		}
+	if ech, echErr := getECHList(); echErr == nil {
+		tlsCfg, _ = buildTLSConfigWithECH(serverName, ech)
 	}
-	if ech, err := getECHList(); err == nil {
-		tlsCfg, err = buildTLSConfigWithECH(serverName, ech)
-		if err != nil {
-			tlsCfg = buildStandardTLSConfig(serverName, cfg.Insecure)
-		} else {
-			tlsCfg.InsecureSkipVerify = cfg.Insecure
-		}
+	if tlsCfg != nil {
+		tlsCfg.InsecureSkipVerify = cfg.Insecure
 	} else {
 		tlsCfg = buildStandardTLSConfig(serverName, cfg.Insecure)
 	}
@@ -344,18 +346,4 @@ func probeRTTLoop(sess *smux.Session, idx int, channelRTT *[]int64, done chan er
 		atomic.StoreInt64(&(*channelRTT)[idx], rtt)
 		<-ticker.C
 	}
-}
-
-var _ io.ReadWriteCloser = (*smux.Stream)(nil)
-
-func (p *ECHPool) Close() error {
-    p.wsConnsMu.Lock()
-    defer p.wsConnsMu.Unlock()
-    for i, sess := range p.smuxConns {
-        if sess != nil {
-            _ = sess.Close()
-            p.smuxConns[i] = nil
-        }
-    }
-    return nil
 }
