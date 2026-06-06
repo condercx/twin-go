@@ -42,11 +42,12 @@ type wsChannel struct {
 }
 
 type Server struct {
-	cfg *ServerConfig
+	cfg    *ServerConfig
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 	srvCtx *serverContext
+	doneCh chan struct{}
 }
 
 func NewServer(cfg *ServerConfig) (*Server, error) {
@@ -59,6 +60,7 @@ func NewServer(cfg *ServerConfig) (*Server, error) {
 		ctx:    ctx,
 		cancel: cancel,
 		srvCtx: &serverContext{cfg: cfg},
+		doneCh: make(chan struct{}),
 	}, nil
 }
 
@@ -67,6 +69,10 @@ func (s *Server) Start() error {
 		s.wg.Add(1)
 		go s.runListener(l)
 	}
+	go func() {
+		s.wg.Wait()
+		close(s.doneCh)
+	}()
 	logf("[server] started with %d listener(s)", len(s.cfg.Listeners))
 	return nil
 }
@@ -164,8 +170,10 @@ func (s *Server) runListener(lc ListenerConfig) {
 		}
 	} else {
 		logf("[server] WS listening on %s", lc.Listen)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.ListenAndServe(); err != nil {
 			logf("[server] WS %s error: %v", lc.Listen, err)
+			// Fatal error - exit to prevent deadlock
+			panic(err)
 		}
 	}
 }
@@ -409,4 +417,8 @@ func shortID(id string) string {
 
 func newSOCKS5UDPRelay(targetAddr, forwardAddr string) (UDPRelayer, error) {
 	return nil, errors.New("SOCKS5 forward: not yet fully implemented")
+}
+
+func (s *Server) Done() <-chan struct{} {
+	return s.doneCh
 }
