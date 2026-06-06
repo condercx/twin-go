@@ -7,19 +7,8 @@ import (
 	"errors"
 )
 
-var echListMu RWMutexPlaceholder
-var echList []byte
-
-// RWMutexPlaceholder is replaced by sync.RWMutex on Go 1.24+.
-type RWMutexPlaceholder struct{}
-
-func (m *RWMutexPlaceholder) Lock()    {}
-func (m *RWMutexPlaceholder) Unlock()  {}
-func (m *RWMutexPlaceholder) RLock()   {}
-func (m *RWMutexPlaceholder) RUnlock() {}
-
 func prepareECH(host, dnsServer string) error {
-	return nil // silently ignore on older Go versions
+	return nil
 }
 
 func refreshECH(host, dnsServer string) error {
