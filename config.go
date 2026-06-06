@@ -2,181 +2,114 @@ package twin
 
 import (
 	"fmt"
-	qtls "github.com/metacubex/tls"
-	"net"
-	"net/url"
 	"strconv"
 	"strings"
-	"time"
+	"net"
 )
+
+type TLSMode string
 
 const (
-	DefaultInitialStreamReceiveWindow     = 8 * 1024 * 1024
-	DefaultMaxStreamReceiveWindow         = 64 * 1024 * 1024
-	DefaultInitialConnectionReceiveWindow = 16 * 1024 * 1024
-	DefaultMaxConnectionReceiveWindow     = 256 * 1024 * 1024
-	DefaultMaxIdleTimeout                 = 120 * time.Second
-	DefaultKeepAlivePeriod                = 15 * time.Second
-	DefaultUDPPayloadSize                 = 1200
-	DefaultMaxIncomingStreams             = 1024
-
-	maxBurstPackets        = 30
-	defaultBurstMultiplier = 3.0
-
-	smallPacketThreshold = 200
-	highLossThreshold    = 0.15
-	mediumLossThreshold  = 0.05
+	TLSModeWS  TLSMode = "ws"
+	TLSModeWSS TLSMode = "wss"
 )
 
-type SideStrategy int64
-
-const (
-	SideStrategyAuto   SideStrategy = 0
-	SideStrategyMirror SideStrategy = 1
-	SideStrategySplit  SideStrategy = 2
-)
-
-func (s SideStrategy) String() string {
-	switch s {
-	case SideStrategyAuto:
-		return "auto"
-	case SideStrategyMirror:
-		return "mirror"
-	case SideStrategySplit:
-		return "split"
-	default:
-		return "unknown"
-	}
+type ClientConfig struct {
+	Password     string
+	ServerAddr   string
+	ServerPort   int
+	TLSMode      TLSMode
+	SNI          string
+	Insecure     bool
+	ConnCount    int
+	ECHHost      string
+	ECHDNSServer string
+	ProxyIPs     []string
 }
 
-func ParseSideStrategy(v string) (SideStrategy, error) {
-	switch strings.ToLower(v) {
-	case "auto", "":
-		return SideStrategyAuto, nil
-	case "mirror":
-		return SideStrategyMirror, nil
-	case "split":
-		return SideStrategySplit, nil
-	default:
-		return SideStrategyAuto, fmt.Errorf("unknown side strategy: %s", v)
-	}
+type ServerConfig struct {
+	Password  string
+	Listeners []ListenerConfig
+	Forward   string
 }
 
-type Config struct {
-	ServerAddr string `json:"server,omitempty"`
-	ServerPort int    `json:"port,omitempty"`
-	Password   string `json:"password,omitempty"`
-	SNI        string `json:"sni,omitempty"`
-	SkipCert   bool   `json:"skip-cert-verify,omitempty"`
-	Fingerprint string `json:"fingerprint,omitempty"`
-
-	UpBPS   uint64 `json:"up,omitempty"`
-	DownBPS uint64 `json:"down,omitempty"`
-
-	SideChannel  bool         `json:"side-channel,omitempty"`
-	SideStrategy SideStrategy `json:"side-strategy,omitempty"`
-
-	InitialStreamReceiveWindow     uint64 `json:"initial-stream-receive-window,omitempty"`
-	MaxStreamReceiveWindow         uint64 `json:"max-stream-receive-window,omitempty"`
-	InitialConnectionReceiveWindow uint64 `json:"initial-connection-receive-window,omitempty"`
-	MaxConnectionReceiveWindow     uint64 `json:"max-connection-receive-window,omitempty"`
-	MaxIncomingStreams             int64  `json:"max-incoming-streams,omitempty"`
-
-	KeepAlivePeriod time.Duration `json:"-"`
-	MaxIdleTimeout  time.Duration `json:"-"`
-	DisablePMTU     *bool         `json:"-"`
-
-	TLSCert  qtls.Certificate `json:"-"`
-	CertFile string `json:"cert-file,omitempty"`
-	KeyFile  string `json:"key-file,omitempty"`
+type ListenerConfig struct {
+	Listen   string
+	TLSMode  TLSMode
+	CertFile string
+	KeyFile  string
 }
 
-func DefaultConfig() Config {
-	return Config{
-		SideChannel:  true,
-		SideStrategy: SideStrategyAuto,
-		InitialStreamReceiveWindow:     DefaultInitialStreamReceiveWindow,
-		MaxStreamReceiveWindow:         DefaultMaxStreamReceiveWindow,
-		InitialConnectionReceiveWindow: DefaultInitialConnectionReceiveWindow,
-		MaxConnectionReceiveWindow:     DefaultMaxConnectionReceiveWindow,
-		KeepAlivePeriod:                0,
-		MaxIdleTimeout:                 0,
-		MaxIncomingStreams:             DefaultMaxIncomingStreams,
-	}
-}
+const DefaultECHHost = "cloudflare-ech.com"
+const DefaultECHDNSServer = "https://doh.pub/dns-query"
 
-func ParseConfig(rawURL string) (*Config, error) {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return nil, fmt.Errorf("twin: parse url: %w", err)
+func (c *ClientConfig) fillDefaults() error {
+	if c.Password == "" {
+		return fmt.Errorf("twin: password is required")
 	}
-	cfg := DefaultConfig()
-	cfg.ServerAddr = u.Hostname()
-	portStr := u.Port()
-	if portStr != "" {
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			return nil, fmt.Errorf("twin: invalid port: %w", err)
-		}
-		cfg.ServerPort = port
-	} else {
-		cfg.ServerPort = 443
+	if c.ServerAddr == "" {
+		return fmt.Errorf("twin: server address is required")
 	}
-	q := u.Query()
-	if v := q.Get("password"); v != "" {
-		cfg.Password = v
+	if c.ServerPort == 0 {
+		c.ServerPort = 443
 	}
-	if v := q.Get("sni"); v != "" {
-		cfg.SNI = v
+	if c.TLSMode == "" {
+		c.TLSMode = TLSModeWSS
 	}
-	if v := q.Get("up"); v != "" {
-		cfg.UpBPS = parseBPS(v)
+	if c.SNI == "" {
+		c.SNI = c.ServerAddr
 	}
-	if v := q.Get("down"); v != "" {
-		cfg.DownBPS = parseBPS(v)
+	if c.ConnCount <= 0 {
+		c.ConnCount = 3
 	}
-	if v := q.Get("skip-cert-verify"); v == "true" || v == "1" {
-		cfg.SkipCert = true
+	if c.TLSMode == TLSModeWSS && c.ECHHost == "" {
+		c.ECHHost = DefaultECHHost
 	}
-	if v := q.Get("fingerprint"); v != "" {
-		cfg.Fingerprint = v
+	if c.TLSMode == TLSModeWSS && c.ECHDNSServer == "" {
+		c.ECHDNSServer = DefaultECHDNSServer
 	}
-	if v := q.Get("side-channel"); v == "false" || v == "0" {
-		cfg.SideChannel = false
-	}
-	if v := q.Get("side-strategy"); v != "" {
-		if s, err := ParseSideStrategy(v); err == nil {
-			cfg.SideStrategy = s
+	var cleaned []string
+	for _, ip := range c.ProxyIPs {
+		if ip = strings.TrimSpace(ip); ip != "" {
+			cleaned = append(cleaned, ip)
 		}
 	}
-	return &cfg, nil
+	c.ProxyIPs = cleaned
+	return nil
 }
 
-func parseBPS(s string) uint64 {
-	s = strings.ToUpper(strings.TrimSpace(s))
-	if s == "" {
-		return 0
+func (c *ClientConfig) ServerURL() string {
+	scheme := "ws"
+	if c.TLSMode == TLSModeWSS {
+		scheme = "wss"
 	}
-	var multiplier uint64 = 1
-	switch {
-	case strings.HasSuffix(s, "G"):
-		multiplier = 1000 * 1000 * 1000
-		s = strings.TrimSuffix(s, "G")
-	case strings.HasSuffix(s, "M"):
-		multiplier = 1000 * 1000
-		s = strings.TrimSuffix(s, "M")
-	case strings.HasSuffix(s, "K"):
-		multiplier = 1000
-		s = strings.TrimSuffix(s, "K")
+	host := c.ServerAddr
+	port := c.ServerPort
+	if h, p, err := net.SplitHostPort(host); err == nil {
+		host = h
+		if p != "" {
+			if parsed, e := strconv.Atoi(p); e == nil {
+				port = parsed
+			}
+		}
 	}
-	v, _ := strconv.ParseUint(s, 10, 64)
-	return v * multiplier
+	return fmt.Sprintf("%s://%s:%d/", scheme, host, port)
 }
 
-func (c *Config) ServerAddrString() string {
-	if c.ServerPort != 0 {
-		return net.JoinHostPort(c.ServerAddr, strconv.Itoa(c.ServerPort))
+func (s *ServerConfig) fillDefaults() error {
+	if s.Password == "" {
+		return fmt.Errorf("twin: server password is required")
 	}
-	return c.ServerAddr
+	if len(s.Listeners) == 0 {
+		return fmt.Errorf("twin: at least one listener required")
+	}
+	for i, l := range s.Listeners {
+		if l.Listen == "" {
+			return fmt.Errorf("twin: listener %d: listen address required", i)
+		}
+		if l.TLSMode == "" {
+			s.Listeners[i].TLSMode = TLSModeWS
+		}
+	}
+	return nil
 }
-

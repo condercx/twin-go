@@ -2,346 +2,233 @@ package twin
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	qtls "github.com/metacubex/tls"
-
-	"github.com/metacubex/quic-go"
-	"github.com/metacubex/quic-go/congestion"
-	"github.com/condercx/twin-go/obfs"
-)
-
-const (
-	openStreamTimeout  = 10 * time.Second
-	headerWriteTimeout = 10 * time.Second
+	"github.com/xtaci/smux"
 )
 
 type Client struct {
-	config *Config
-	conn   *quic.Conn
-
-	udpSessionMutex sync.RWMutex
-	udpSessionMap   map[uint32]chan *udpMessage
-	udpDefragger    defragger
-
-	sideMux  atomic.Pointer[FlowMux]
-	sideMux2 atomic.Pointer[FlowMux]
-
-	obfuscator    *obfs.ObfsPacketConn
-	rawPacketConn net.PacketConn
+	cfg     *ClientConfig
+	pool    *ECHPool
+	closed  bool
+	closeMu sync.Mutex
 }
 
-func NewClient(cfg *Config) *Client {
-	return &Client{config: cfg}
+type udpSession struct {
+	stream  *smux.Stream
+	addrStr string
+	recvCh  chan udpPacketMsg
+	closeCh chan struct{}
 }
 
-func (c *Client) IsClosed() bool {
-	if c.conn == nil {
-		return true
-	}
-	return c.conn.Context().Err() != nil
+type udpPacketMsg struct {
+	addr string
+	data []byte
 }
 
-func (c *Client) Dial(ctx context.Context, packetConn net.PacketConn, udpAddr *net.UDPAddr) error {
-	// Wrap with obfuscation
-	c.rawPacketConn = packetConn
-	key := DeriveObfsKey(c.config.Password)
-	c.obfuscator = obfs.NewObfsPacketConn(packetConn, key)
-
-	tlsCfg := &qtls.Config{
-		ServerName:         c.config.SNI,
-		InsecureSkipVerify: c.config.SkipCert,
-		MinVersion:         qtls.VersionTLS13,
-		NextProtos:         []string{"twin"},
-	}
-	if tlsCfg.ServerName == "" {
-		tlsCfg.ServerName = c.config.ServerAddr
-	}
-
-	quicCfg := NewQUICConfig(c.config)
-	conn, err := quic.Dial(ctx, c.obfuscator, udpAddr, tlsCfg, quicCfg)
-	if err != nil {
-		return fmt.Errorf("quic dial: %w", err)
-	}
-	c.conn = conn
-	return c.postAuth()
-}
-
-func (c *Client) SetConn(conn *quic.Conn) error {
-	c.conn = conn
-	return c.postAuth()
-}
-
-func (c *Client) SetObfuscatedConn(conn *quic.Conn, rawPkt net.PacketConn) error {
-	c.rawPacketConn = rawPkt
-	key := DeriveObfsKey(c.config.Password)
-	c.obfuscator = obfs.NewObfsPacketConn(rawPkt, key)
-	c.conn = conn
-	return c.postAuth()
-}
-
-func (c *Client) postAuth() error {
-	if err := c.authConn(); err != nil {
-		return err
-	}
-	c.udpSessionMap = make(map[uint32]chan *udpMessage)
-	go c.handleMessage()
-
-	if c.config.SideChannel {
-		go c.openSideStream(0x03)
-		go c.openSideStream(0x04)
-	}
-
-	return nil
-}
-
-func (c *Client) openSideStream(streamType byte) {
-	stream, err := c.openStream()
-	if err != nil {
-		logf("side channel: open stream failed: %v", err)
-		return
-	}
-	if err := writeHeader(stream, []byte{streamType}); err != nil {
-		stream.Close()
-		return
-	}
-	mux := NewFlowMux(stream)
-	mux.Start()
-
-	if streamType == 0x03 {
-		c.sideMux.Store(mux)
-	} else {
-		c.sideMux2.Store(mux)
-	}
-}
-
-func (c *Client) authConn() error {
-	ctx, cancel := context.WithTimeout(context.Background(), authStreamDeadline)
-	defer cancel()
-
-	stream, err := c.conn.OpenStreamSync(ctx)
-	if err != nil {
-		return fmt.Errorf("open auth stream: %w", err)
-	}
-	defer stream.Close()
-
-	sendBPS := c.config.UpBPS
-	recvBPS := c.config.DownBPS
-	if sendBPS == 0 {
-		sendBPS = 100 * 1024 * 1024
-	}
-	if recvBPS == 0 {
-		recvBPS = 100 * 1024 * 1024
-	}
-
-	if err := WriteAuth(stream, c.config.Password, sendBPS, recvBPS); err != nil {
-		return fmt.Errorf("auth: %w", err)
-	}
-
-	if sendBPS > 0 {
-		logf("setting client BrutalSender send BPS=%d", sendBPS)
-		sender := NewBrutalSender(congestion.ByteCount(sendBPS))
-		c.conn.SetCongestionControl(sender)
-	}
-
-	addr := c.config.ServerAddrString()
-	logf("twin client: connected and authenticated to %s (tx=%d bps, rx=%d bps)", addr, sendBPS, recvBPS)
-	return nil
-}
-
-func (c *Client) openStream() (*quic.Stream, error) {
-	if c.conn == nil {
-		return nil, fmt.Errorf("not connected")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), openStreamTimeout)
-	defer cancel()
-	stream, err := c.conn.OpenStreamSync(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("open stream: %w", err)
-	}
-	return stream, nil
-}
-
-func writeHeader(stream *quic.Stream, b []byte) error {
-	stream.SetWriteDeadline(time.Now().Add(headerWriteTimeout))
-	_, err := stream.Write(b)
-	stream.SetWriteDeadline(time.Time{})
-	return err
-}
-
-func (c *Client) DialTCP(ctx context.Context, target string) (io.ReadWriteCloser, error) {
-	if c.config.SideChannel && c.sideMux.Load() != nil {
-		return c.sideMux.Load().OpenFlow(target)
-	}
-
-	// Legacy direct stream path when side channel disabled
-	stream, err := c.openStream()
-	if err != nil {
+func NewClient(cfg *ClientConfig) (*Client, error) {
+	if err := cfg.fillDefaults(); err != nil {
 		return nil, err
 	}
-	if err := writeHeader(stream, []byte{0x00}); err != nil {
-		stream.Close()
-		return nil, fmt.Errorf("write type: %w", err)
+	c := &Client{
+		cfg: cfg,
 	}
-	targetBytes := []byte(target)
-	lenBuf := []byte{byte(len(targetBytes) >> 8), byte(len(targetBytes))}
-	if err := writeHeader(stream, lenBuf); err != nil {
-		stream.Close()
+	c.pool = NewECHPool(cfg)
+	c.pool.Start()
+	if err := c.pool.WaitForReady(10 * time.Second); err != nil {
 		return nil, err
 	}
-	if err := writeHeader(stream, targetBytes); err != nil {
-		stream.Close()
-		return nil, err
-	}
-	return stream, nil
+	return c, nil
 }
 
-func (c *Client) SideMux() *FlowMux {
-	return c.sideMux.Load()
-}
-
-func (c *Client) SideMux2() *FlowMux {
-	return c.sideMux2.Load()
-}
-
-func (c *Client) Conn() *quic.Conn {
-	return c.conn
-}
-
-func (c *Client) handleMessage() {
-	for {
-		msg, err := c.conn.ReceiveDatagram(c.conn.Context())
-		if err != nil {
-			return
-		}
-		var udpMsg udpMessage
-		if err := udpMsg.unpack(msg); err != nil {
-			continue
-		}
-		dfMsg := c.udpDefragger.feed(udpMsg)
-		if dfMsg == nil {
-			continue
-		}
-		c.udpSessionMutex.RLock()
-		ch, ok := c.udpSessionMap[dfMsg.SessionID]
-		if ok {
-			select {
-			case ch <- dfMsg:
-			default:
-			}
-		}
-		c.udpSessionMutex.RUnlock()
-	}
-}
-
-func (c *Client) NewUDPSession(ctx context.Context) (*UDPSession, error) {
-	stream, err := c.openStream()
+func (c *Client) DialTCP(ctx context.Context, target string) (net.Conn, error) {
+	stream, chID, _, err := c.pool.openTCPStream(target)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("twin dial tcp: %w", err)
 	}
-	if _, err := stream.Write([]byte{0x02}); err != nil {
-		stream.Close()
-		return nil, fmt.Errorf("write udp open: %w", err)
-	}
-	if err := writeTarget(stream, ""); err != nil {
-		stream.Close()
-		return nil, err
-	}
+	logf("[client] TCP open: %s channel:%d", target, chID)
+	return &twinStream{stream: stream}, nil
+}
 
-	var resp [5]byte
-	if _, err := io.ReadFull(stream, resp[:]); err != nil {
-		stream.Close()
-		return nil, fmt.Errorf("read udp session response: %w", err)
-	}
-	if resp[0] != 0 {
-		stream.Close()
-		return nil, fmt.Errorf("server rejected UDP session")
-	}
-	sessionID := uint32(resp[1])<<24 | uint32(resp[2])<<16 | uint32(resp[3])<<8 | uint32(resp[4])
-	stream.Close()
-
-	nCh := make(chan *udpMessage, 1024)
-	c.udpSessionMutex.Lock()
-	c.udpSessionMap[sessionID] = nCh
-	c.udpSessionMutex.Unlock()
-
-	return &UDPSession{
-		client:    c,
-		SessionID: sessionID,
-		MsgCh:     nCh,
+func (c *Client) ListenPacket() (net.PacketConn, error) {
+	return &twinPacketConn{
+		client:   c,
+		inbound:  make(chan udpPacketMsg, 256),
+		sessions: make(map[string]*udpSession),
+		closeCh:  make(chan struct{}),
 	}, nil
 }
 
-type UDPSession struct {
-	client    *Client
-	SessionID uint32
-	MsgCh     <-chan *udpMessage
-	closed    bool
+func (c *Client) Close() error {
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
+	_ = c.pool.Close()
+	c.closed = true
+	return nil
 }
 
-func (s *UDPSession) WriteTo(data []byte, host string, port uint16) error {
-	msg := udpMessage{
-		SessionID: s.SessionID,
-		Host:      host,
-		Port:      port,
-		FragCount: 1,
-		Data:      data,
+func (c *Client) IsClosed() bool {
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
+	if c.closed {
+		return true
 	}
-	err := s.client.conn.SendDatagram(msg.pack())
+	return false
+}
+
+func (c *Client) openUDPSession(target string) (*udpSession, error) {
+	stream, chID, _, err := c.pool.openUDPStream(target)
 	if err != nil {
-		var errSize *quic.DatagramTooLargeError
-		if !errors.As(err, &errSize) {
-			return err
-		}
-		fragMsgs := fragUDPMessage(msg, int(errSize.MaxDatagramPayloadSize))
-		for _, fragMsg := range fragMsgs {
-			err = s.client.conn.SendDatagram(fragMsg.pack())
+		return nil, err
+	}
+	us := &udpSession{
+		stream:  stream,
+		addrStr: target,
+		recvCh:  make(chan udpPacketMsg, 256),
+		closeCh: make(chan struct{}),
+	}
+	go func() {
+		for {
+			addrStr, payload, err := readUDPReply(stream)
 			if err != nil {
-				return err
+				close(us.closeCh)
+				return
+			}
+			select {
+			case us.recvCh <- udpPacketMsg{addr: addrStr, data: payload}:
+			default:
+			}
+		}
+	}()
+	logf("[client] UDP open: %s channel:%d", target, chID)
+	return us, nil
+}
+
+// twinStream wraps a smux.Stream as net.Conn
+type twinStream struct {
+	stream *smux.Stream
+}
+
+func (s *twinStream) Read(b []byte) (int, error)           { return s.stream.Read(b) }
+func (s *twinStream) Write(b []byte) (int, error)          { return s.stream.Write(b) }
+func (s *twinStream) Close() error                          { return s.stream.Close() }
+func (s *twinStream) LocalAddr() net.Addr                   { return nil }
+func (s *twinStream) RemoteAddr() net.Addr                  { return nil }
+func (s *twinStream) SetDeadline(t time.Time) error         { return s.stream.SetDeadline(t) }
+func (s *twinStream) SetReadDeadline(t time.Time) error     { return s.stream.SetReadDeadline(t) }
+func (s *twinStream) SetWriteDeadline(t time.Time) error    { return s.stream.SetWriteDeadline(t) }
+
+var _ net.Conn = (*twinStream)(nil)
+
+// twinPacketConn implements net.PacketConn over twin UDP
+type twinPacketConn struct {
+	client   *Client
+	mu       sync.Mutex
+	sessions map[string]*udpSession
+	closed   bool
+	inbound  chan udpPacketMsg
+	closeCh  chan struct{}
+	wg       sync.WaitGroup
+}
+
+func (pc *twinPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	addrStr := addr.String()
+	pc.mu.Lock()
+	sess, ok := pc.sessions[addrStr]
+	pc.mu.Unlock()
+
+	if !ok {
+		newSess, err := pc.client.openUDPSession(addrStr)
+		if err != nil {
+			return 0, fmt.Errorf("open udp session: %w", err)
+		}
+		pc.mu.Lock()
+		if pc.closed {
+			pc.mu.Unlock()
+			_ = newSess.stream.Close()
+			return 0, net.ErrClosed
+		}
+		if existing, ok := pc.sessions[addrStr]; ok {
+			pc.mu.Unlock()
+			_ = newSess.stream.Close()
+			sess = existing
+		} else {
+			pc.sessions[addrStr] = newSess
+			pc.mu.Unlock()
+			sess = newSess
+			pc.wg.Add(1)
+			go pc.udpReadLoop(newSess)
+		}
+	}
+
+	if err := writeChunk(sess.stream, p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (pc *twinPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	select {
+	case <-pc.closeCh:
+		return 0, nil, net.ErrClosed
+	case pkt, ok := <-pc.inbound:
+		if !ok {
+			return 0, nil, net.ErrClosed
+		}
+		n := copy(p, pkt.data)
+		udpAddr, _ := net.ResolveUDPAddr("udp", pkt.addr)
+		return n, udpAddr, nil
+	}
+}
+
+func (pc *twinPacketConn) udpReadLoop(sess *udpSession) {
+	defer pc.wg.Done()
+	defer func() {
+		pc.mu.Lock()
+		delete(pc.sessions, sess.addrStr)
+		pc.mu.Unlock()
+	}()
+	for {
+		select {
+		case <-sess.closeCh:
+			return
+		case pkt, ok := <-sess.recvCh:
+			if !ok {
+				return
+			}
+			select {
+			case pc.inbound <- pkt:
+			default:
 			}
 		}
 	}
+}
+
+func (pc *twinPacketConn) Close() error {
+	pc.mu.Lock()
+	if pc.closed {
+		pc.mu.Unlock()
+		return nil
+	}
+	pc.closed = true
+	sessions := pc.sessions
+	pc.sessions = make(map[string]*udpSession)
+	close(pc.closeCh)
+	pc.mu.Unlock()
+
+	for _, sess := range sessions {
+		_ = sess.stream.Close()
+	}
+	pc.wg.Wait()
 	return nil
 }
 
-func (s *UDPSession) ReadFrom() ([]byte, string, uint16, error) {
-	msg := <-s.MsgCh
-	if msg == nil {
-		return nil, "", 0, io.EOF
-	}
-	return msg.Data, msg.Host, msg.Port, nil
-}
+func (pc *twinPacketConn) LocalAddr() net.Addr                { return &net.UDPAddr{IP: net.IPv4zero, Port: 0} }
+func (pc *twinPacketConn) SetDeadline(t time.Time) error      { return nil }
+func (pc *twinPacketConn) SetReadDeadline(t time.Time) error  { return nil }
+func (pc *twinPacketConn) SetWriteDeadline(t time.Time) error { return nil }
 
-func (s *UDPSession) Close() {
-	if s.closed {
-		return
-	}
-	s.closed = true
-	s.client.udpSessionMutex.Lock()
-	delete(s.client.udpSessionMap, s.SessionID)
-	s.client.udpSessionMutex.Unlock()
-}
-
-func (c *Client) Close() error {
-	if c.sideMux.Load() != nil {
-		c.sideMux.Load().Close()
-	}
-	if c.sideMux2.Load() != nil {
-		c.sideMux2.Load().Close()
-	}
-	if c.conn != nil {
-		return c.conn.CloseWithError(0, "client closing")
-	}
-	return nil
-}
-
-
-
-
-
+var _ net.PacketConn = (*twinPacketConn)(nil)
