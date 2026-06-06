@@ -13,17 +13,14 @@ import (
 var (
 	echListMu sync.RWMutex
 	echList   []byte
+	refreshMu sync.Mutex
 )
 
 func prepareECH(host, dnsServer string) error {
 	ech, err := queryHTTPSRecord(host, dnsServer)
-	if err != nil {
-		return err
-	}
+	if err != nil { return nil }
 	raw, err := base64.StdEncoding.DecodeString(ech)
-	if err != nil {
-		return err
-	}
+	if err != nil { return nil }
 	echListMu.Lock()
 	echList = raw
 	echListMu.Unlock()
@@ -31,8 +28,8 @@ func prepareECH(host, dnsServer string) error {
 }
 
 func refreshECH(host, dnsServer string) error {
-	echListMu.Lock()
-	defer echListMu.Unlock()
+	refreshMu.Lock()
+	defer refreshMu.Unlock()
 	return prepareECH(host, dnsServer)
 }
 
