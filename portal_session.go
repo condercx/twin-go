@@ -104,10 +104,11 @@ func (ps *PortalSession) streamLoop() {
 	for {
 		stream, err := ps.conn.AcceptStream(ps.ctx)
 		if err != nil {
-			if ps.ctx.Err() != nil {
+			if ps.ctx.Err() != nil || ps.conn.Context().Err() != nil {
 				return
 			}
 			logf("portal session: accept stream error: %v", err)
+			time.Sleep(time.Second)
 			continue
 		}
 		go ps.handleStream(stream)
@@ -293,7 +294,7 @@ func (r *udpRelay) allocateID() uint32 {
 
 func (r *udpRelay) run() {
 	for {
-		raw, err := r.conn.ReceiveDatagram(r.ctx)
+		raw, err := r.conn.ReceiveDatagram(r.conn.Context())
 		if err != nil {
 			return
 		}
@@ -372,3 +373,4 @@ func (s *udpSocket) readLoop() {
 	s.relay.mu.Unlock()
 	s.conn.Close()
 }
+

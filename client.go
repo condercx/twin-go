@@ -216,7 +216,7 @@ func (c *Client) Conn() *quic.Conn {
 
 func (c *Client) handleMessage() {
 	for {
-		msg, err := c.conn.ReceiveDatagram(context.Background())
+		msg, err := c.conn.ReceiveDatagram(c.conn.Context())
 		if err != nil {
 			return
 		}
